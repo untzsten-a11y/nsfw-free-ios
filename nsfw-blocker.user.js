@@ -46,6 +46,7 @@
     var CLASSES = ['Drawing', 'Hentai', 'Neutral', 'Porn', 'Sexy'];
 
     var host = location.hostname.toLowerCase();
+    var inFrame = window.top !== window.self;
     function hostIn(list) { return list.some(function (d) { return host === d || host.slice(-d.length - 1) === '.' + d; }); }
     if (hostIn(WHITELIST)) return;
 
@@ -98,11 +99,12 @@
     // Recent domain blocks ({ domain: expiry time }) live in the script's storage, not in a cookie: a
     // cookie would be sent to the site and tell it the user has a filter.
     var canStore = typeof GM !== 'undefined' && !!GM.getValue && !!GM.setValue;
-    function getBlocks() {
+    function readStore(key) { // {} if storage is missing, slow (1.5 s) or fails
         if (!canStore) return Promise.resolve({});
-        return Promise.race([GM.getValue('blocks', {}), new Promise(function (r) { setTimeout(r, 1500, {}); })])
-            .then(function (b) { return b || {}; }, function () { return {}; });
+        return Promise.race([GM.getValue(key, {}), new Promise(function (r) { setTimeout(r, 1500, {}); })])
+            .then(function (v) { return v || {}; }, function () { return {}; });
     }
+    function getBlocks() { return readStore('blocks'); }
     function rememberBlock(minutes) {
         getBlocks().then(function (b) {
             var now = Date.now();
@@ -142,11 +144,11 @@
     }
     // Tap inside a shielded area? Also catches buttons layered on top of the player that aren't
     // inside it in the DOM (e.g. a positioned "Download" overlay).
-    var shields = [];
-    function shield(el) {
+    var shields = []; // player areas only: blocked links are always in the tap's composedPath
+    function shield(el, area) {
         if (el.hasAttribute('data-nsfw-shield')) return;
         el.setAttribute('data-nsfw-shield', '');
-        shields.push(el);
+        if (area) shields.push(el);
     }
     function inShield(e) {
         var pt = e.touches ? e.touches[0] : e;
@@ -194,6 +196,7 @@
                 if (!v) return;
                 if (!v.muted) { v.muted = true; v._nsfwMuted = true; }
                 if (t === 'play') {
+                    if (!blocked) startFramePoll();
                     v.disablePictureInPicture = true;
                     if (v._nsfwBad) v.pause(); // confirmed NSFW: can't be started again
                 }
@@ -208,19 +211,19 @@
     function gmGet(url, type) {
         return new Promise(function (resolve, reject) {
             if (typeof GM === 'undefined' || !GM.xmlHttpRequest) return reject(new Error('no GM'));
-            var t = setTimeout(function () { reject(new Error('timeout')); }, TIMEOUT);
+            var fail = function (why) { clearTimeout(t); reject(new Error(why)); };
+            var t = setTimeout(fail, TIMEOUT, 'timeout');
             GM.xmlHttpRequest({
                 method: 'GET', url: url, responseType: type, timeout: TIMEOUT,
                 // Image hosts often refuse requests without one. Only the origin, like Safari sends
                 // cross-site: the full URL would leak search terms and tokens to the image host.
                 headers: { Referer: location.origin + '/' },
                 onload: function (r) {
-                    clearTimeout(t);
-                    if (r.status >= 200 && r.status < 300 && r.response) resolve(r.response);
-                    else reject(new Error('HTTP ' + r.status));
+                    if (r.status >= 200 && r.status < 300 && r.response) { clearTimeout(t); resolve(r.response); }
+                    else fail('HTTP ' + r.status);
                 },
-                onerror: function () { clearTimeout(t); reject(new Error('network error')); },
-                ontimeout: function () { clearTimeout(t); reject(new Error('timeout')); }
+                onerror: function () { fail('network error'); },
+                ontimeout: function () { fail('timeout'); }
             });
         });
     }
@@ -231,17 +234,13 @@
         return c.signal;
     }
     var noFetch = {}; // origins where fetch failed (usually no CORS): go straight to GM next time
-    function get(url, type) { // type: 'json' | 'text' | 'arraybuffer' | 'blob'
+    function get(url, type) { // type: 'arraybuffer' | 'blob'
         var origin = new URL(url, location.href).origin;
-        var viaGM = function () {
-            return gmGet(url, type === 'json' ? 'text' : type).then(function (d) {
-                return type === 'json' && typeof d === 'string' ? JSON.parse(d) : d;
-            });
-        };
+        var viaGM = function () { return gmGet(url, type); };
         if (noFetch[origin]) return viaGM();
         return fetch(url, { signal: timeoutSignal() }).then(function (r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
-            return type === 'json' ? r.json() : type === 'text' ? r.text() : type === 'blob' ? r.blob() : r.arrayBuffer();
+            return type === 'blob' ? r.blob() : r.arrayBuffer();
         }).catch(function () { noFetch[origin] = 1; return viaGM(); });
     }
 
@@ -309,24 +308,24 @@
             var have = [];
             var got = function (name) { return function (v) { have.push(name); status('loading model... ' + have.join(' ')); return v; }; };
             status('loading model...');
-            // Nothing downloaded is used before its hash is checked.
-            var fetchVerified = function (url, name) {
-                return get(url, 'arraybuffer').then(function (buf) { return verified(buf, name); }).then(got(name));
-            };
-            var download = function () {
-                have = [];
-                return Promise.all([
-                    fetchVerified(MODEL_URL + 'model.json', 'json').then(function (buf) { return JSON.parse(new TextDecoder().decode(buf)); }),
-                    fetchVerified(MODEL_URL + 'group1-shard1of1', 'weights'),
-                    tf ? Promise.resolve() : fetchVerified(TF_URL, 'tf').then(loadTf)
-                ]);
+            // Nothing downloaded is used before its hash is checked. Each file gets one retry of its own,
+            // so a slow one doesn't make the others download again.
+            var fetchVerified = function (url, name, then) {
+                var once = function () {
+                    return get(url, 'arraybuffer').then(function (buf) { return verified(buf, name); }).then(then);
+                };
+                return once().catch(once).then(got(name));
             };
             var deadline = new Promise(function (_, reject) {
                 setTimeout(function () {
                     reject(new Error('took over ' + MODEL_DEADLINE / 1000 + ' s (arrived: ' + (have.join(' ') || 'nothing') + ')'));
                 }, MODEL_DEADLINE);
             });
-            var load = Promise.resolve().then(download).catch(download) // one retry
+            var load = Promise.all([
+                fetchVerified(MODEL_URL + 'model.json', 'json', function (buf) { return JSON.parse(new TextDecoder().decode(buf)); }),
+                fetchVerified(MODEL_URL + 'group1-shard1of1', 'weights'),
+                fetchVerified(TF_URL, 'tf', loadTf)
+            ])
                 .then(function (res) {
                     var specs = [];
                     res[0].weightsManifest.forEach(function (g) { specs.push.apply(specs, g.weights); });
@@ -348,11 +347,14 @@
         return modelPromise;
     }
 
-    var canvas = document.createElement('canvas');
-    canvas.width = canvas.height = SIZE;
-    var ctx = canvas.getContext('2d', { willReadFrequently: true });
+    var canvas = null, ctx = null; // created on first use: most frames never classify
 
     function predict(model, draw) {
+        if (!canvas) {
+            canvas = document.createElement('canvas');
+            canvas.width = canvas.height = SIZE;
+            ctx = canvas.getContext('2d', { willReadFrequently: true });
+        }
         ctx.fillStyle = '#7f7f7f';
         ctx.fillRect(0, 0, SIZE, SIZE);
         draw();
@@ -413,12 +415,10 @@
 
     // ----- verdict cache -----
     // Loaded on first use (pages without images never read it); saved at most every 10 s and on leaving.
-    var cache = {}, cacheReady = null, cacheTimer = null, hasStore = canStore;
+    var cache = {}, cacheReady = null, cacheTimer = null;
     function loadCache() {
         return cacheReady || (cacheReady = blockCheck.then(function () { // a blocked domain classifies nothing
-            if (!hasStore) return;
-            return Promise.race([GM.getValue('cache2', {}), new Promise(function (r) { setTimeout(r, 1500, {}); })])
-                .then(function (c) { cache = c || {}; }, function () {});
+            return readStore('cache2').then(function (c) { cache = c; });
         }));
     }
     function saveCache() {
@@ -431,7 +431,7 @@
     function cachePut(url, safe) {
         if (url.length > 500) return; // skip huge data: URLs
         cache[url] = safe ? 1 : 0;
-        if (hasStore && !cacheTimer) cacheTimer = setTimeout(saveCache, 10000);
+        if (canStore && !cacheTimer) cacheTimer = setTimeout(saveCache, 10000);
     }
     addEventListener('pagehide', function () { if (cacheTimer) saveCache(); });
 
@@ -449,8 +449,9 @@
     function readable(el) {
         try { samplePixels(el, 1); return true; } catch (e) { return false; }
     }
+    function shownSrc(img) { return img.currentSrc || img.src; } // the URL actually displayed
     function classifyUrl(el, url) {
-        if (el.tagName === 'IMG' && el.complete && el.naturalWidth && (el.currentSrc || el.src) === url && readable(el)) {
+        if (el.tagName === 'IMG' && el.complete && el.naturalWidth && shownSrc(el) === url && readable(el)) {
             return classify(el, el.naturalWidth, el.naturalHeight);
         }
         return get(url, 'blob').catch(function (e) { throw new Error('download: ' + e.message); })
@@ -474,8 +475,14 @@
     // ----- verdicts -----
     // Confirmed-NSFW media: links to its file are blocked. Videos are also stopped for good and their
     // player area is shielded, so "Download"/"Save" buttons next to it can't be tapped.
-    var blockedUrls = {};
-    function blockUrl(u) { try { if (u) blockedUrls[new URL(u, location.href).href] = 1; } catch (e) {} }
+    var blockedUrls = {}, blockedCount = 0;
+    function blockUrl(u) {
+        try {
+            if (!u) return;
+            u = new URL(u, location.href).href;
+            if (!blockedUrls[u]) { blockedUrls[u] = 1; blockedCount++; }
+        } catch (e) {}
+    }
     function markLinks(root) {
         root.querySelectorAll('a[href]:not([data-nsfw-shield])').forEach(function (a) { if (blockedUrls[a.href]) shield(a); });
     }
@@ -492,7 +499,7 @@
             if (r.width * r.height > screen * 0.6) break;
             box = el;
         }
-        shield(box);
+        shield(box, true);
         // Only a NSFW frame (not a poster) removes the source: a false positive would break the player for good.
         if (fromFrame) {
             v.removeAttribute('src');
@@ -514,16 +521,18 @@
         else {
             counts.nsfw++;
             el.removeAttribute('data-nsfw-safe');
+            var before = blockedCount;
             if (el.tagName === 'VIDEO') lockVideo(el, fromFrame);
             blockUrl(el._nsfwUrl);
-            markLinks(document);
+            if (blockedCount > before) markLinks(document); // later nodes are marked by scan()
         }
         showCounts();
         if (counts.nsfw >= PAGE_BLOCK_NSFW && counts.nsfw / (counts.ok + counts.nsfw) >= PAGE_BLOCK_RATIO) blockPage(PAGE_BLOCK_MINUTES, 'images');
     }
     // Small iframes are nearly always ads/widgets: they don't each download the model (which slowed
     // the page's own download). Their small icons are still let through by size in check().
-    function tinyFrame() { return window.top !== window.self && (innerWidth < MIN_FRAME || innerHeight < MIN_FRAME); }
+    function tinyFrame() { return inFrame && (innerWidth < MIN_FRAME || innerHeight < MIN_FRAME); }
+    function idle() { return blocked || failed || tinyFrame(); }
     // An image shown in several places is downloaded and classified once. The job runs for the first
     // element still showing it when its turn comes.
     var pending = {};
@@ -531,6 +540,7 @@
         var p = pending[url];
         if (p) { p.els.push(el); return p.job; }
         p = pending[url] = { els: [el] };
+        getModel().catch(function () {}); // download the model alongside the first image, not after it
         p.job = enqueue(function () {
             var live = p.els.filter(function (e) { return e.isConnected && e._nsfwUrl === url; });
             if (!live.length) return Promise.reject(new Error('stale'));
@@ -539,7 +549,7 @@
         return p.job;
     }
     function judge(el, url) {
-        if (blocked || failed || tinyFrame()) return;
+        if (idle()) return;
         try { url = new URL(url, location.href).href; } catch (e) { return; }
         if (el._nsfwUrl === url) return; // already checked or in progress
         el._nsfwUrl = url;
@@ -579,32 +589,35 @@
         var m = /url\(\s*["']?(.*?)["']?\s*\)/.exec(el.style.backgroundImage || '');
         return m && m[1];
     }
-    function check(el) {
+    function check(el, rect) { // rect: the element's box, when the caller already has it
         var tag = el.tagName, url, w, h;
         if (tag === 'VIDEO') {
             if (el.poster) judge(el, el.poster);
-        } else if (tag === 'IMG' || tag === 'image') {
-            if (tag === 'IMG') {
-                // Judged once loaded (see the 'load' listener): then its size is known, so icons need no
-                // download, and currentSrc is the image actually shown, not the one it is replacing.
-                if (!el.complete) return;
-                url = el.currentSrc || el.src; w = el.naturalWidth; h = el.naturalHeight;
-                el._nsfwShown = url;
-                if (url && !w) return; // broken image: nothing to show
-            }
-            else { url = el.getAttribute('href') || el.getAttribute('xlink:href'); var r = el.getBoundingClientRect(); w = r.width; h = r.height; }
-            if (!url) return; // no src yet (lazy image): re-checked on load / attribute change
-            if (trustedSvg(url) || (w && (w < MIN_SIZE || h < MIN_SIZE))) return el.setAttribute('data-nsfw-safe', '');
-            judge(el, url);
-        } else {
-            var bg = bgUrl(el);
-            if (bg && !trustedSvg(bg)) judge(el, bg); else el.setAttribute('data-nsfw-safe', '');
+            return;
         }
+        if (tag === 'IMG') {
+            // Judged once loaded (see the 'load' listener): then its size is known, so icons need no
+            // download, and currentSrc is the image actually shown, not the one it is replacing.
+            if (!el.complete) return;
+            url = shownSrc(el); w = el.naturalWidth; h = el.naturalHeight;
+            el._nsfwShown = url;
+            if (!url || !w) return; // no src yet (lazy image, re-checked on load) or broken
+        } else if (tag === 'image') {
+            url = el.getAttribute('href') || el.getAttribute('xlink:href');
+            if (!url) return; // re-checked on attribute change
+            var r = rect || el.getBoundingClientRect(); w = r.width; h = r.height;
+        } else {
+            url = bgUrl(el);
+            if (url && !trustedSvg(url)) judge(el, url); else el.setAttribute('data-nsfw-safe', '');
+            return;
+        }
+        if (trustedSvg(url) || (w && (w < MIN_SIZE || h < MIN_SIZE))) return el.setAttribute('data-nsfw-safe', '');
+        judge(el, url);
     }
 
     // Videos: check the current frame while playing; a safe frame unblurs, an NSFW frame stops it.
     function checkFrame(v) {
-        if (v._nsfwBusy || v.paused || !v.videoWidth || blocked || failed || tinyFrame()) return;
+        if (v._nsfwBusy || v.paused || !v.videoWidth || idle()) return;
         // unverified: every 3 s; already safe: every 12 s (to catch content that turns explicit later)
         if (v.hasAttribute('data-nsfw-safe') && Date.now() - (v._nsfwLast || 0) < 12000) return;
         v._nsfwLast = Date.now();
@@ -629,10 +642,15 @@
         } catch (e) { return false; }
     }
     var roots = [document]; // document + shadow roots, so videos inside web components get checked too
-    setInterval(function () {
-        roots = roots.filter(function (r) { return r === document || r.host.isConnected; });
-        roots.forEach(function (r) { r.querySelectorAll('video').forEach(checkFrame); });
-    }, 3000);
+    var framePoll = null;
+    function startFramePoll() { // from the first 'play': pages without video never poll
+        if (framePoll) return;
+        framePoll = setInterval(function () {
+            if (blocked || failed) { clearInterval(framePoll); return; }
+            roots = roots.filter(function (r) { return r === document || r.host.isConnected; });
+            roots.forEach(function (r) { r.querySelectorAll('video').forEach(checkFrame); });
+        }, 3000);
+    }
 
     // ----- 3. page-word check: block evident adult sites before anything is played or downloaded -----
     // Words alone never block: the site must also label itself adult (RTA/rating meta, 2257 or 18+
@@ -682,8 +700,9 @@
             // a menu of short explicit links = a tube site's category navigation
             var links = document.getElementsByTagName('a'), hits = 0, seen = {};
             for (var i = 0; i < links.length && i < 400; i++) {
-                var t = lower(links[i].textContent);
+                var t = links[i].textContent;
                 if (t.length > 40) continue;
+                t = lower(t);
                 var m = t.match(HARD), term = m ? m[0] : softWord(t);
                 if (term) { hits++; seen[term] = 1; }
             }
@@ -692,7 +711,12 @@
         return { score: score, block: identity && score >= 6 };
     }
     // Run when the page loads, then again as content arrives (max every 2 s, 5 times per page).
-    var textSkip = hostIn(TEXT_SKIP) || window.top !== window.self, textRuns = 0, textLast = 0, textPath = '';
+    var textSkip = hostIn(TEXT_SKIP) || inFrame, textRuns = 0, textLast = 0, textPath = '';
+    var textTimer = null;
+    function textSoon() { // from DOM changes: runs in its own task, bursts of changes merge into one run
+        if (textTimer || textSkip || blocked) return;
+        textTimer = setTimeout(function () { textTimer = null; textCheck(false); }, Math.max(0, 2010 - (Date.now() - textLast)));
+    }
     function textCheck(force) {
         if (textSkip || blocked || !document.body || document.readyState === 'loading') return;
         if (location.pathname !== textPath) { textPath = location.pathname; textRuns = 0; force = true; }
@@ -708,7 +732,7 @@
     // ----- watching the page -----
     var io = new IntersectionObserver(function (entries) {
         entries.forEach(function (en) {
-            if (en.isIntersecting) { io.unobserve(en.target); en.target._nsfwSeen = true; check(en.target); }
+            if (en.isIntersecting) { io.unobserve(en.target); en.target._nsfwSeen = true; check(en.target, en.boundingClientRect); }
         });
     }, { rootMargin: '150%' });
     function watch(el) {
@@ -739,7 +763,7 @@
         scan(root);
         new MutationObserver(function (muts) {
             ensureStyle();
-            textCheck(false);
+            textSoon();
             muts.forEach(function (m) {
                 if (m.type === 'attributes') {
                     var t = m.target;
@@ -753,7 +777,7 @@
         // (lazy loaders swapping a placeholder, srcset). Off-screen images wait for the viewport observer.
         root.addEventListener('load', function (e) {
             var el = e.target;
-            if (el.tagName !== 'IMG' || !el._nsfwSeen || el._nsfwShown === (el.currentSrc || el.src)) return;
+            if (el.tagName !== 'IMG' || !el._nsfwSeen || el._nsfwShown === shownSrc(el)) return;
             el.removeAttribute('data-nsfw-safe');
             check(el);
         }, true);
